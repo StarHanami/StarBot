@@ -1,122 +1,244 @@
 package com.starlwr.bot.bilibili.service
 
-import java.io.ByteArrayInputStream
-import java.io.EOFException
 import java.util.Base64
 
-/** Minimal protobuf decoder for bilibili.live.gift.v1.SendGiftBroadcast.
- * It deliberately decodes only fields used by the event pipeline and skips
- * unknown wire fields so newer server fields cannot invalidate a gift batch.
- */
 class SendGiftV2Decoder {
     data class Gift(
         val id: Long,
         val name: String,
         val count: Long,
+        val price: Long,
         val discountPrice: Long,
         val totalCoin: Long,
         val coinType: String,
+        val transactionId: String,
         val timestamp: Long,
+        val action: String,
         val image: String,
     )
 
-    data class Blind(val id: Long, val name: String, val price: Long)
+    data class Blind(val id: Long, val name: String, val price: Long) {
+        fun isPresent() = id != 0L || name.isNotBlank() || price != 0L
+    }
+
+    data class Medal(
+        val targetUid: Long,
+        val name: String,
+        val level: Int,
+        val lighted: Boolean,
+        val guardIcon: String,
+    ) {
+        fun isPresent() = targetUid != 0L
+    }
+
+    data class Sender(
+        val uid: Long,
+        val name: String,
+        val face: String,
+        val medal: Medal?,
+    )
 
     data class Result(
-        val senderUid: Long,
-        val senderName: String,
-        val senderFace: String,
+        val uid: Long,
+        val name: String,
+        val face: String,
+        val guardLevel: Int,
+        val switchEnabled: Boolean?,
+        val wealthLevel: Int?,
+        val sender: Sender?,
         val gifts: List<Gift>,
         val blind: Blind?,
         val raw: ByteArray,
         val unknownFieldCount: Int,
-    )
-
-    fun decode(base64: String): Result {
-        val raw = Base64.getDecoder().decode(base64)
-        return decode(raw)
+    ) {
+        val senderUid get() = sender?.uid?.takeIf { it != 0L } ?: uid
+        val senderName get() = sender?.name?.takeIf { it.isNotBlank() } ?: name
+        val senderFace get() = sender?.face?.takeIf { it.isNotBlank() } ?: face
+        val senderMedal get() = sender?.medal
     }
 
+    fun decode(base64: String): Result = decode(Base64.getDecoder().decode(base64))
+
     fun decode(raw: ByteArray): Result {
-        val root = Reader(raw)
+        val reader = ProtobufWireReader(raw)
         var uid = 0L
         var name = ""
         var face = ""
-        var senderUid = 0L
-        var senderName = ""
-        var senderFace = ""
+        var guardLevel = 0
+        var switchEnabled: Boolean? = null
+        var wealthLevel: Int? = null
+        var sender: Sender? = null
+        var rootMedal: Medal? = null
         var blind: Blind? = null
         val gifts = mutableListOf<Gift>()
         var unknown = 0
-        while (!root.end()) {
-            val tag = root.varint()
-            when ((tag ushr 3).toInt()) {
-                1 -> uid = root.varint()
-                2 -> name = root.string()
-                3 -> face = root.string()
-                9 -> blind = parseBlind(root.bytes())
-                10 -> gifts += parseGift(root.bytes())
-                15 -> {
-                    val sender = parseSender(root.bytes())
-                    senderUid = sender.first; senderName = sender.second; senderFace = sender.third
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> uid = reader.varint()
+                2 -> name = reader.string()
+                3 -> face = reader.string()
+                5 -> guardLevel = reader.varint().toInt()
+                8 -> rootMedal = parseLegacyMedal(reader.bytes())
+                9 -> blind = parseBlind(reader.bytes()).takeIf(Blind::isPresent)
+                10 -> gifts += parseGift(reader.bytes())
+                11 -> switchEnabled = reader.varint() != 0L
+                13 -> wealthLevel = parseWealth(reader.bytes())
+                15 -> sender = parseSender(reader.bytes())
+                else -> {
+                    reader.skip(tag.wireType)
+                    unknown++
                 }
-                8 -> root.skip((tag and 7).toInt())
-                else -> { root.skip((tag and 7).toInt()); unknown++ }
             }
         }
-        if (senderUid == 0L) senderUid = uid
-        if (senderName.isBlank()) senderName = name
-        if (senderFace.isBlank()) senderFace = face
-        return Result(senderUid, senderName, senderFace, gifts, blind, raw.copyOf(), unknown)
+        if (sender?.medal == null && rootMedal?.isPresent() == true) {
+            sender = (sender ?: Sender(0, "", "", null)).copy(medal = rootMedal)
+        }
+        return Result(uid, name, face, guardLevel, switchEnabled, wealthLevel, sender,
+            gifts.toList(), blind, raw.copyOf(), unknown)
     }
 
     private fun parseGift(raw: ByteArray): Gift {
-        val r = Reader(raw)
-        var id = 0L; var name = ""; var count = 0L; var discount = 0L; var total = 0L
-        var coin = ""; var timestamp = 0L; var image = ""
-        while (!r.end()) {
-            val tag = r.varint(); when ((tag ushr 3).toInt()) {
-                1 -> id = r.varint(); 2 -> name = r.string(); 3 -> count = r.varint()
-                6 -> discount = r.varint(); 7 -> total = r.varint(); 8 -> coin = r.string()
-                10 -> timestamp = r.varint(); 35 -> image = parseEffect(r.bytes())
-                else -> r.skip((tag and 7).toInt())
+        val reader = ProtobufWireReader(raw)
+        var id = 0L
+        var name = ""
+        var count = 0L
+        var price = 0L
+        var discountPrice = 0L
+        var totalCoin = 0L
+        var coinType = ""
+        var transactionId = ""
+        var timestamp = 0L
+        var action = ""
+        var image = ""
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> id = reader.varint()
+                2 -> name = reader.string()
+                3 -> count = reader.varint()
+                5 -> price = reader.varint()
+                6 -> discountPrice = reader.varint()
+                7 -> totalCoin = reader.varint()
+                8 -> coinType = reader.string()
+                9 -> transactionId = reader.string()
+                10 -> timestamp = reader.varint()
+                18 -> action = reader.string()
+                35 -> image = parseGiftMaterial(reader.bytes())
+                else -> reader.skip(tag.wireType)
             }
         }
-        return Gift(id, name, count, discount, total, coin, timestamp, image)
+        return Gift(id, name, count, price, discountPrice, totalCoin, coinType,
+            transactionId, timestamp, action, image)
     }
 
-    private fun parseEffect(raw: ByteArray): String {
-        val r = Reader(raw); var image = ""
-        while (!r.end()) { val tag = r.varint(); if ((tag ushr 3).toInt() == 1) image = r.string() else r.skip((tag and 7).toInt()) }
+    private fun parseGiftMaterial(raw: ByteArray): String {
+        val reader = ProtobufWireReader(raw)
+        var image = ""
+        while (!reader.end()) {
+            val tag = reader.tag()
+            if (tag.field == 1) image = reader.string() else reader.skip(tag.wireType)
+        }
         return image
     }
 
     private fun parseBlind(raw: ByteArray): Blind {
-        val r = Reader(raw); var id = 0L; var name = ""; var price = 0L
-        while (!r.end()) { val tag = r.varint(); when ((tag ushr 3).toInt()) {
-            2 -> id = r.varint(); 3 -> name = r.string(); 6 -> price = r.varint(); else -> r.skip((tag and 7).toInt())
-        } }
+        val reader = ProtobufWireReader(raw)
+        var id = 0L
+        var name = ""
+        var price = 0L
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                2 -> id = reader.varint()
+                3 -> name = reader.string()
+                6 -> price = reader.varint()
+                else -> reader.skip(tag.wireType)
+            }
+        }
         return Blind(id, name, price)
     }
 
-    private fun parseSender(raw: ByteArray): Triple<Long, String, String> {
-        val r = Reader(raw); var uid = 0L; var name = ""; var face = ""
-        while (!r.end()) { val tag = r.varint(); when ((tag ushr 3).toInt()) {
-            1 -> uid = r.varint(); 2 -> { val b = Reader(r.bytes()); while (!b.end()) { val t = b.varint(); if ((t ushr 3).toInt() == 1) name = b.string() else b.skip((t and 7).toInt()) } }
-            else -> r.skip((tag and 7).toInt())
-        } }
-        return Triple(uid, name, face)
+    private fun parseSender(raw: ByteArray): Sender {
+        val reader = ProtobufWireReader(raw)
+        var uid = 0L
+        var name = ""
+        var face = ""
+        var medal: Medal? = null
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> uid = reader.varint()
+                2 -> parseUserBase(reader.bytes()).also { name = it.first; face = it.second }
+                3 -> medal = parseSenderMedal(reader.bytes()).takeIf(Medal::isPresent)
+                else -> reader.skip(tag.wireType)
+            }
+        }
+        return Sender(uid, name, face, medal)
     }
 
-    private class Reader(private val input: ByteArrayInputStream) {
-        constructor(bytes: ByteArray) : this(ByteArrayInputStream(bytes))
-        fun end() = input.available() == 0
-        fun varint(): Long { var result = 0L; var shift = 0; while (shift < 64) { val b = input.read(); if (b < 0) throw EOFException(); result = result or ((b.toLong() and 0x7f) shl shift); if (b and 0x80 == 0) return result; shift += 7 }; throw IllegalArgumentException("protobuf varint overflow") }
-        fun bytes(): ByteArray { val n = varint(); require(n in 0..input.available().toLong()) { "invalid protobuf length" }; return input.readNBytes(n.toInt()) }
-        fun string() = bytes().toString(Charsets.UTF_8)
-        fun skip(wire: Int) { when (wire) {
-            0 -> varint(); 1 -> input.skipNBytes(8); 2 -> bytes(); 3 -> { while (!end()) { val tag = varint(); if ((tag and 7).toInt() == 4) break; skip((tag and 7).toInt()) } }
-            4 -> Unit; 5 -> input.skipNBytes(4); else -> throw IllegalArgumentException("unsupported protobuf wire type $wire")
-        } }
+    private fun parseUserBase(raw: ByteArray): Pair<String, String> {
+        val reader = ProtobufWireReader(raw)
+        var name = ""
+        var face = ""
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> name = reader.string()
+                2 -> face = reader.string()
+                else -> reader.skip(tag.wireType)
+            }
+        }
+        return name to face
+    }
+
+    private fun parseSenderMedal(raw: ByteArray): Medal {
+        val reader = ProtobufWireReader(raw)
+        var targetUid = 0L
+        var name = ""
+        var level = 0
+        var lighted = false
+        var guardIcon = ""
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> name = reader.string()
+                2 -> level = reader.varint().toInt()
+                9 -> lighted = reader.varint() != 0L
+                10 -> targetUid = reader.varint()
+                13 -> guardIcon = reader.string()
+                else -> reader.skip(tag.wireType)
+            }
+        }
+        return Medal(targetUid, name, level, lighted, guardIcon)
+    }
+
+    private fun parseLegacyMedal(raw: ByteArray): Medal {
+        val reader = ProtobufWireReader(raw)
+        var targetUid = 0L
+        var name = ""
+        var level = 0
+        var lighted = false
+        while (!reader.end()) {
+            val tag = reader.tag()
+            when (tag.field) {
+                1 -> targetUid = reader.varint()
+                5 -> level = reader.varint().toInt()
+                6 -> name = reader.string()
+                8 -> lighted = reader.varint() != 0L
+                else -> reader.skip(tag.wireType)
+            }
+        }
+        return Medal(targetUid, name, level, lighted, "")
+    }
+
+    private fun parseWealth(raw: ByteArray): Int? {
+        val reader = ProtobufWireReader(raw)
+        var level: Int? = null
+        while (!reader.end()) {
+            val tag = reader.tag()
+            if (tag.field == 1) level = reader.varint().toInt() else reader.skip(tag.wireType)
+        }
+        return level
     }
 }

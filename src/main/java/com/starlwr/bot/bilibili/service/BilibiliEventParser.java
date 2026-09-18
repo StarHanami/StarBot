@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.BiFunction;
-import com.starlwr.bot.bilibili.service.SendGiftV2Decoder;
 
 /**
  * Bilibili 事件解析器
@@ -41,7 +40,7 @@ public class BilibiliEventParser {
 
     private final BilibiliDebugFileLogger debugFileLog;
 
-    private final SendGiftV2Decoder sendGiftV2Decoder = new SendGiftV2Decoder();
+    private final BilibiliV2EventParser v2EventParser;
 
     private final Map<String, BiFunction<JSONObject, LiveStreamerInfo, StarBotBaseLiveEvent>> parsers = Map.of(
             "LIVE", BilibiliEventParser.this::parseLiveOnData,
@@ -56,11 +55,20 @@ public class BilibiliEventParser {
     );
 
     @Autowired
-    public BilibiliEventParser(StarBotBilibiliProperties properties, BilibiliApiUtil bilibili, BilibiliGiftService giftService, BilibiliDebugFileLogger debugFileLog) {
+    public BilibiliEventParser(StarBotBilibiliProperties properties, BilibiliApiUtil bilibili,
+                               BilibiliGiftService giftService, BilibiliDebugFileLogger debugFileLog,
+                               BilibiliV2EventParser v2EventParser) {
         this.properties = properties;
         this.bilibili = bilibili;
         this.giftService = giftService;
         this.debugFileLog = debugFileLog;
+        this.v2EventParser = v2EventParser;
+    }
+
+    public BilibiliEventParser(StarBotBilibiliProperties properties, BilibiliApiUtil bilibili,
+                               BilibiliGiftService giftService, BilibiliDebugFileLogger debugFileLog) {
+        this(properties, bilibili, giftService, debugFileLog,
+                new BilibiliV2EventParser(bilibili, giftService));
     }
 
     /**
@@ -70,7 +78,8 @@ public class BilibiliEventParser {
      */
     public Optional<StarBotBaseLiveEvent> parse(JSONObject data, LiveStreamerInfo source) {
         String type = data.getString("cmd");
-        if ("SEND_GIFT_V2".equals(type) || "UNIVERSAL_EVENT_GIFT_V2".equals(type)) {
+        if ("SEND_GIFT_V2".equals(type) || "INTERACT_WORD_V2".equals(type)
+                || "UNIVERSAL_EVENT_GIFT_V2".equals(type)) {
             return parseMany(data, source).stream().findFirst();
         }
         if (properties.getDebug().isLiveRoomRawMessageLog()) {
@@ -88,68 +97,19 @@ public class BilibiliEventParser {
         return Optional.empty();
     }
 
-    /** Parse commands which may expand to more than one event (notably V2 gifts). */
+    /** Parse commands which may expand to more than one event. */
     public List<StarBotBaseLiveEvent> parseMany(JSONObject data, LiveStreamerInfo source) {
         String type = data.getString("cmd");
-        if ("SEND_GIFT_V2".equals(type)) {
+        if ("SEND_GIFT_V2".equals(type) || "INTERACT_WORD_V2".equals(type)
+                || "UNIVERSAL_EVENT_GIFT_V2".equals(type)) {
             if (properties.getDebug().isLiveRoomRawMessageLog()) {
                 debugFileLog.live(type, source.getRoomId(), data.toJSONString());
             }
-            try {
-                JSONObject envelope = data.getJSONObject("data");
-                JSONObject nested = envelope == null ? null : envelope.getJSONObject("data");
-                String encoded = nested == null ? null : nested.getString("pb");
-                if (encoded == null || encoded.isBlank()) return List.of();
-                SendGiftV2Decoder.Result result = sendGiftV2Decoder.decode(encoded);
-                List<StarBotBaseLiveEvent> events = new ArrayList<>();
-                for (SendGiftV2Decoder.Gift gift : result.getGifts()) {
-                    JSONObject synthetic = new JSONObject();
-                    synthetic.put("cmd", "SEND_GIFT");
-                    JSONObject giftData = new JSONObject();
-                    giftData.put("uid", result.getSenderUid());
-                    giftData.put("uname", result.getSenderName());
-                    giftData.put("face", result.getSenderFace());
-                    giftData.put("timestamp", gift.getTimestamp());
-                    giftData.put("giftId", gift.getId());
-                    giftData.put("giftName", gift.getName());
-                    giftData.put("num", Math.toIntExact(Math.min(Integer.MAX_VALUE, gift.getCount())));
-                    giftData.put("discount_price", gift.getDiscountPrice());
-                    giftData.put("coin_type", gift.getCoinType());
-                    JSONObject giftInfo = new JSONObject();
-                    giftInfo.put("img_basic", gift.getImage());
-                    giftData.put("gift_info", giftInfo);
-                    JSONObject sender = new JSONObject();
-                    sender.put("uid", result.getSenderUid());
-                    JSONObject base = new JSONObject();
-                    base.put("name", result.getSenderName());
-                    base.put("face", result.getSenderFace());
-                    sender.put("base", base);
-                    JSONObject medal = new JSONObject();
-                    medal.put("ruid", 0L); medal.put("name", ""); medal.put("level", 0);
-                    medal.put("is_light", 0); medal.put("guard_level", 0);
-                    sender.put("medal", medal);
-                    giftData.put("sender_uinfo", sender);
-                    if (result.getBlind() != null) {
-                        JSONObject blind = new JSONObject();
-                        blind.put("original_gift_id", result.getBlind().getId());
-                        blind.put("original_gift_name", result.getBlind().getName());
-                        blind.put("original_gift_price", result.getBlind().getPrice());
-                        giftData.put("blind_gift", blind);
-                    }
-                    synthetic.put("data", giftData);
-                    parse(synthetic, source).ifPresent(events::add);
-                }
-                return events;
-            } catch (Exception e) {
-                log.warn("处理直播间 {} 的 SEND_GIFT_V2 失败，已丢弃该批次: {}", source.getRoomId(), e.toString());
-                return List.of();
-            }
-        }
-        if ("UNIVERSAL_EVENT_GIFT_V2".equals(type)) {
-            if (properties.getDebug().isLiveRoomRawMessageLog()) {
-                debugFileLog.live(type, source.getRoomId(), data.toJSONString());
-            }
-            return List.of(new BilibiliRawLiveEvent(source, type, data.toJSONString()));
+            return switch (type) {
+                case "SEND_GIFT_V2" -> v2EventParser.parseGifts(data, source, properties.getLive().isCompleteEvent());
+                case "INTERACT_WORD_V2" -> v2EventParser.parseInteraction(data, source, properties.getLive().isCompleteEvent());
+                default -> List.of(new BilibiliRawLiveEvent(source, type, data.toJSONString()));
+            };
         }
         return parse(data, source).stream().toList();
     }
