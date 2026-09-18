@@ -284,8 +284,8 @@ public class BilibiliApiUtil {
                         log.info("Bilibili API 返回 -352，但已有 WBI 重算任务正在进行，本请求不再重复触发");
                     }
                 }
-                // 4101130: 请求数据发生错误，请刷新或稍后重试, 4101131: 加载错误，请稍后再试, 4101132: 加载错误，请稍后再试, 22015: 您的账号异常，请稍后再试
-                if (code == 4101130 || code == 4101131 || code == 4101132 || code == 22015) {
+                // 1024 is the transient timeout response used by current Live Web APIs.
+                if (code == 4101130 || code == 4101131 || code == 4101132 || code == 22015 || code == 1024) {
                     throw new NetworkException(code);
                 }
                 String message = result.containsKey("message") ? result.getString("message") : "接口未返回错误信息";
@@ -643,11 +643,23 @@ public class BilibiliApiUtil {
         http.asyncGet(url, headers).whenComplete((response, exception) -> {
             if (exception != null) {
                 networkLog.httpFailure(trace, exception);
-                log.error("直播间 {} 发送 Web 心跳包异常, 偶然出现此异常可忽略", roomId, exception);
+                if (isTimeoutFailure(exception)) {
+                    log.warn("直播间 {} 发送 Web 心跳包超时，本次遥测已跳过", roomId);
+                    log.debug("Web 心跳包超时详情: room={}", roomId, exception);
+                } else {
+                    log.error("直播间 {} 发送 Web 心跳包异常", roomId, exception);
+                }
             } else {
                 networkLog.httpResponse(trace, 200, Collections.emptyMap(), response);
             }
         });
+    }
+
+    private boolean isTimeoutFailure(Throwable error) {
+        for (Throwable current = error; current != null; current = current.getCause()) {
+            if (current instanceof TimeoutException || current instanceof SocketTimeoutException) return true;
+        }
+        return false;
     }
 
     /**
